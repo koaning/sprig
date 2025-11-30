@@ -1,24 +1,36 @@
 from __future__ import annotations
 
+import functools
 import os
 import shutil
 import subprocess
 import sys
 from pathlib import Path
-from typing import Iterable, Optional
+from typing import Iterable, Optional, Tuple
 
 import typer
 
 from . import __version__
 
-app = typer.Typer(help="Manage agent workspaces inside a git repo.", invoke_without_command=False)
-branch_app = typer.Typer(help="Commands meant to run from inside a workspace.")
+app = typer.Typer(
+    help="Manage agent workspaces inside a git repo.",
+    invoke_without_command=False,
+    no_args_is_help=True,
+    pretty_exceptions_enable=False,
+)
+branch_app = typer.Typer(
+    help="Commands meant to run from inside a workspace.",
+    no_args_is_help=True,
+    pretty_exceptions_enable=False,
+)
 app.add_typer(branch_app, name="branch")
 
 WORKSPACES_DIR = ".workspaces"
 DEFAULT_BRANCH = "main"
 BRANCH_ENV = "AGENT_WS_BRANCH"
 SKIP_SETUP_ENV = "AGENT_WS_SKIP_SETUP"
+SKIP_GIT_ENV = "AGENT_WS_SKIP_GIT"
+DEFAULT_WORKSPACE_BRANCH_PREFIX = "workspace/"
 
 
 class SprigError(Exception):
@@ -28,6 +40,18 @@ class SprigError(Exception):
 def echo(message: str, quiet: bool = False) -> None:
     if not quiet:
         typer.echo(message)
+
+
+def handle_cli_errors(func):
+    @functools.wraps(func)
+    def wrapper(*args, **kwargs):
+        try:
+            return func(*args, **kwargs)
+        except SprigError as exc:
+            echo(f"Error: {exc}")
+            raise typer.Exit(code=1) from None
+
+    return wrapper
 
 
 def truthy(value: Optional[str]) -> bool:
@@ -81,8 +105,9 @@ def ensure_workspace_command(cwd: Path) -> tuple[Path, str]:
 
 def run_command(args: Iterable[str], cwd: Path, quiet: bool = False) -> subprocess.CompletedProcess:
     try:
+        cmd = [*args]
         return subprocess.run(
-            list(args),
+            cmd,
             cwd=cwd,
             check=True,
             text=True,
@@ -95,22 +120,14 @@ def run_command(args: Iterable[str], cwd: Path, quiet: bool = False) -> subproce
         raise SprigError(f"Command failed ({' '.join(args)}): {exc}") from exc
 
 
-def ensure_git_clean(root: Path, force: bool) -> None:
-    result = subprocess.run(
-        ["git", "status", "--porcelain"],
-        cwd=root,
-        check=True,
-        text=True,
-        stdout=subprocess.PIPE,
-        stderr=subprocess.PIPE,
-    )
-    if result.stdout.strip() and not force:
-        raise SprigError("Working tree is dirty. Commit, stash, or re-run with --force.")
-
-
-def git_pull(root: Path, branch: str, quiet: bool) -> None:
-    echo(f"Pulling from origin/{branch}...", quiet)
-    run_command(["git", "pull", "origin", branch], cwd=root, quiet=quiet)
+def git_fetch(root: Path, branch: str, quiet: bool) -> None:
+    echo(f"Fetching origin/{branch}...", quiet)
+    try:
+        run_command(["git", "fetch", "origin", branch], cwd=root, quiet=quiet)
+    except SprigError as exc:
+        raise SprigError(
+            f"Git pull failed for origin/{branch}. If you're offline or in CI, set {SKIP_GIT_ENV}=1."
+        ) from exc
 
 
 def ensure_gitignore(root: Path) -> None:
@@ -177,32 +194,37 @@ def version() -> None:
 
 
 @app.command()
+@handle_cli_errors
 def new(
-    name: Optional[str] = typer.Argument(None, help="Workspace name (defaults to repo name)."),
+    name: str = typer.Argument(..., help="Workspace name."),
     branch: Optional[str] = typer.Option(None, "--branch", "-b", help="Git branch to pull before creating."),
+    workspace_branch: Optional[str] = typer.Option(
+        None, "--workspace-branch", "-w", help="Branch name for the new workspace (defaults to workspace/<name>)."
+    ),
     no_setup: bool = typer.Option(False, "--no-setup", help="Skip `make setup`."),
-    force: bool = typer.Option(False, "--force", help="Proceed even if the working tree is dirty or workspace exists."),
+    force: bool = typer.Option(False, "--force", help="Overwrite an existing workspace if present."),
     quiet: bool = typer.Option(False, "--quiet", help="Reduce output."),
 ) -> None:
     """Create a new workspace from the repo root."""
-    _create_workspace(name, branch, no_setup, force, quiet)
+    _create_workspace(name, branch, workspace_branch, no_setup, force, quiet)
 
 
 @app.command()
+@handle_cli_errors
 def init(
-    name: Optional[str] = typer.Argument(None, help="Workspace name (defaults to repo name)."),
-    branch: Optional[str] = typer.Option(None, "--branch", "-b", help="Git branch to pull before creating."),
-    no_setup: bool = typer.Option(False, "--no-setup", help="Skip `make setup`."),
-    force: bool = typer.Option(False, "--force", help="Proceed even if the working tree is dirty or workspace exists."),
     quiet: bool = typer.Option(False, "--quiet", help="Reduce output."),
 ) -> None:
-    """Alias for `sprig new`."""
-    _create_workspace(name, branch, no_setup, force, quiet)
+    """Prepare repo for sprig by ensuring .workspaces is ignored."""
+    cwd = Path.cwd()
+    root = ensure_root_command(cwd)
+    ensure_gitignore(root)
+    echo(f"Ensured {WORKSPACES_DIR}/ is in .gitignore.", quiet)
 
 
 def _create_workspace(
-    name: Optional[str],
+    name: str,
     branch: Optional[str],
+    workspace_branch: Optional[str],
     no_setup: bool,
     force: bool,
     quiet: bool,
@@ -212,18 +234,16 @@ def _create_workspace(
 
     target_branch = branch or os.environ.get(BRANCH_ENV) or DEFAULT_BRANCH
     skip_setup = no_setup or truthy(os.environ.get(SKIP_SETUP_ENV))
-    workspace_name = name or root.name
-    workspace_dir = root / WORKSPACES_DIR / workspace_name
+    skip_git = truthy(os.environ.get(SKIP_GIT_ENV))
+    workspace_dir = root / WORKSPACES_DIR / name
+    branch_name = workspace_branch or f"{DEFAULT_WORKSPACE_BRANCH_PREFIX}{name}"
 
-    git_pull(root, target_branch, quiet)
-    ensure_git_clean(root, force)
-
-    if workspace_dir.exists():
-        if not force:
-            raise SprigError(f"Workspace {workspace_name} already exists. Use --force to overwrite.")
-        shutil.rmtree(workspace_dir)
-
-    workspace_dir.mkdir(parents=True, exist_ok=True)
+    if skip_git:
+        echo("Skipping git pull/clean (testing or override).", quiet)
+        prepare_directory_only(workspace_dir, force)
+    else:
+        git_fetch(root, target_branch, quiet)
+        create_git_worktree(root, workspace_dir, branch_name, target_branch, force, quiet)
     scaffold_config(workspace_dir)
     ensure_gitignore(root)
 
@@ -237,6 +257,7 @@ def _create_workspace(
 
 
 @app.command()
+@handle_cli_errors
 def list() -> None:
     """List available workspaces (repo root only)."""
     cwd = Path.cwd()
@@ -256,6 +277,7 @@ def list() -> None:
 
 
 @app.command()
+@handle_cli_errors
 def clean(
     name: str = typer.Argument(..., help="Workspace name to remove."),
     yes: bool = typer.Option(False, "--yes", "-y", help="Skip confirmation."),
@@ -277,6 +299,7 @@ def clean(
 
 
 @branch_app.command("status")
+@handle_cli_errors
 def branch_status() -> None:
     """Show status when inside a workspace."""
     cwd = Path.cwd()
@@ -309,6 +332,7 @@ def branch_status() -> None:
 
 
 @branch_app.command("clean")
+@handle_cli_errors
 def branch_clean() -> None:
     """Inform how to clean from within a workspace."""
     cwd = Path.cwd()
@@ -321,9 +345,53 @@ def main() -> None:
     try:
         app()
     except SprigError as exc:
-        typer.echo(f"Error: {exc}", err=True)
-        raise typer.Exit(code=1)
+        echo(f"Error: {exc}")
+        raise typer.Exit(code=1) from None
 
 
 if __name__ == "__main__":
     main()
+def prepare_directory_only(workspace_dir: Path, force: bool) -> None:
+    if workspace_dir.exists():
+        if not force:
+            raise SprigError(f"Workspace {workspace_dir.name} already exists. Use --force to overwrite.")
+        shutil.rmtree(workspace_dir)
+    workspace_dir.mkdir(parents=True, exist_ok=True)
+
+
+def branch_exists(root: Path, branch: str) -> bool:
+    result = subprocess.run(
+        ["git", "rev-parse", "--verify", branch],
+        cwd=root,
+        text=True,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        check=False,
+    )
+    return result.returncode == 0
+
+
+def create_git_worktree(
+    root: Path,
+    workspace_dir: Path,
+    workspace_branch: str,
+    base_branch: str,
+    force: bool,
+    quiet: bool,
+) -> None:
+    base_ref = f"origin/{base_branch}"
+
+    if workspace_dir.exists():
+        if not force:
+            raise SprigError(f"Workspace {workspace_dir.name} already exists. Use --force to overwrite.")
+        run_command(["git", "worktree", "remove", "--force", str(workspace_dir)], cwd=root, quiet=quiet)
+        if workspace_dir.exists():
+            shutil.rmtree(workspace_dir)
+
+    if branch_exists(root, workspace_branch):
+        if not force:
+            raise SprigError(f"Branch {workspace_branch} already exists. Use --force to overwrite.")
+        run_command(["git", "branch", "-D", workspace_branch], cwd=root, quiet=quiet)
+
+    echo(f"Creating worktree at {workspace_dir} on {workspace_branch} from {base_ref}...", quiet)
+    run_command(["git", "worktree", "add", "-B", workspace_branch, str(workspace_dir), base_ref], cwd=root, quiet=quiet)
