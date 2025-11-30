@@ -1,0 +1,18 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "sprig"
+version = "0.1.0"
+description = "CLI to scaffold agent-friendly workspaces inside git repos."
+readme = "README.md"
+requires-python = ">=3.9"
+dependencies = ["typer>=0.12.0"]
+
+[project.scripts]
+sprig = "sprig.cli:main"
+spring = "sprig.cli:main"
+
+[tool.uv]
+dev-dependencies = ["pytest", "ruff"]
