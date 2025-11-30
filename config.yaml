@@ -1,0 +1,5 @@
+# sprig workspace config
+agent: ""
+notes: ""
+paths: []
+env_file: ""
